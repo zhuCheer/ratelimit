@@ -371,7 +371,6 @@ func (tb *Bucket) refeshDBAvailableTokens() {
 	db := tb.redisConn
 
 	tokens, err := redis.Int64(db.Do("GET", dbKey))
-	fmt.Println(tokens, err)
 
 	if err != nil && err != redis.ErrNil {
 		fmt.Println(fmt.Sprintf("ratelimit redis error %v", err))
