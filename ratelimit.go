@@ -8,6 +8,9 @@
 package ratelimit
 
 import (
+	"crypto/md5"
+	"fmt"
+	"github.com/gomodule/redigo/redis"
 	"math"
 	"strconv"
 	"sync"
@@ -42,7 +45,8 @@ import (
 // Bucket represents a token bucket that fills at a predetermined rate.
 // Methods on Bucket may be called concurrently.
 type Bucket struct {
-	clock Clock
+	CacheKey string
+	clock    Clock
 
 	// startTime holds the moment when the bucket was
 	// first created and ticks began.
@@ -70,41 +74,44 @@ type Bucket struct {
 	// latestTick holds the latest tick for which
 	// we know the number of tokens in the bucket.
 	latestTick int64
+
+	redisConn redis.Conn
 }
 
 // NewBucket returns a new token bucket that fills at the
 // rate of one token every fillInterval, up to the given
 // maximum capacity. Both arguments must be
 // positive. The bucket is initially full.
-func NewBucket(fillInterval time.Duration, capacity int64) *Bucket {
-	return NewBucketWithClock(fillInterval, capacity, nil)
+func NewBucket(name string, fillInterval time.Duration, capacity int64) *Bucket {
+	return NewBucketWithClock(name, fillInterval, capacity, nil)
 }
 
 // NewBucketWithClock is identical to NewBucket but injects a testable clock
 // interface.
-func NewBucketWithClock(fillInterval time.Duration, capacity int64, clock Clock) *Bucket {
-	return NewBucketWithQuantumAndClock(fillInterval, capacity, 1, clock)
+func NewBucketWithClock(name string, fillInterval time.Duration, capacity int64, clock Clock) *Bucket {
+	return NewBucketWithQuantumAndClock(name, fillInterval, capacity, 1, clock)
 }
 
 // rateMargin specifes the allowed variance of actual
 // rate from specified rate. 1% seems reasonable.
 const rateMargin = 0.01
+const redisTimeout = 600
 
 // NewBucketWithRate returns a token bucket that fills the bucket
 // at the rate of rate tokens per second up to the given
 // maximum capacity. Because of limited clock resolution,
 // at high rates, the actual rate may be up to 1% different from the
 // specified rate.
-func NewBucketWithRate(rate float64, capacity int64) *Bucket {
-	return NewBucketWithRateAndClock(rate, capacity, nil)
+func NewBucketWithRate(name string, rate float64, capacity int64) *Bucket {
+	return NewBucketWithRateAndClock(name, rate, capacity, nil)
 }
 
 // NewBucketWithRateAndClock is identical to NewBucketWithRate but injects a
 // testable clock interface.
-func NewBucketWithRateAndClock(rate float64, capacity int64, clock Clock) *Bucket {
+func NewBucketWithRateAndClock(name string, rate float64, capacity int64, clock Clock) *Bucket {
 	// Use the same bucket each time through the loop
 	// to save allocations.
-	tb := NewBucketWithQuantumAndClock(1, capacity, 1, clock)
+	tb := NewBucketWithQuantumAndClock(name, 1, capacity, 1, clock)
 	for quantum := int64(1); quantum < 1<<50; quantum = nextQuantum(quantum) {
 		fillInterval := time.Duration(1e9 * float64(quantum) / rate)
 		if fillInterval <= 0 {
@@ -133,14 +140,14 @@ func nextQuantum(q int64) int64 {
 // NewBucketWithQuantum is similar to NewBucket, but allows
 // the specification of the quantum size - quantum tokens
 // are added every fillInterval.
-func NewBucketWithQuantum(fillInterval time.Duration, capacity, quantum int64) *Bucket {
-	return NewBucketWithQuantumAndClock(fillInterval, capacity, quantum, nil)
+func NewBucketWithQuantum(name string, fillInterval time.Duration, capacity, quantum int64) *Bucket {
+	return NewBucketWithQuantumAndClock(name, fillInterval, capacity, quantum, nil)
 }
 
 // NewBucketWithQuantumAndClock is like NewBucketWithQuantum, but
 // also has a clock argument that allows clients to fake the passing
 // of time. If clock is nil, the system clock will be used.
-func NewBucketWithQuantumAndClock(fillInterval time.Duration, capacity, quantum int64, clock Clock) *Bucket {
+func NewBucketWithQuantumAndClock(name string, fillInterval time.Duration, capacity, quantum int64, clock Clock) *Bucket {
 	if clock == nil {
 		clock = realClock{}
 	}
@@ -153,7 +160,13 @@ func NewBucketWithQuantumAndClock(fillInterval time.Duration, capacity, quantum 
 	if quantum <= 0 {
 		panic("token bucket quantum is not > 0")
 	}
+	cacheKey := name
+	if name == "" {
+		cacheKey = md5String(fmt.Sprintf("%d-%v", time.Now().UnixNano(), fillInterval))
+	}
+
 	return &Bucket{
+		CacheKey:        "RateLimitKey:" + cacheKey,
 		clock:           clock,
 		startTime:       clock.Now(),
 		latestTick:      0,
@@ -162,6 +175,11 @@ func NewBucketWithQuantumAndClock(fillInterval time.Duration, capacity, quantum 
 		quantum:         quantum,
 		availableTokens: capacity,
 	}
+}
+
+func (tb *Bucket) WithRedis(db redis.Conn) *Bucket {
+	tb.redisConn = db
+	return tb
 }
 
 // Wait takes count tokens from the bucket, waiting until they are
@@ -224,6 +242,24 @@ func (tb *Bucket) TakeAvailable(count int64) int64 {
 	return tb.takeAvailable(tb.clock.Now(), count)
 }
 
+func (tb *Bucket) TakeAvailableWait(count int64, maxWait time.Duration) (token int64) {
+	timer := time.NewTimer(maxWait)
+	for {
+		select {
+		case <-timer.C:
+			return 0
+		default:
+			token = tb.takeAvailable(tb.clock.Now(), count)
+		}
+
+		if token > 0 {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	return
+}
+
 // takeAvailable is the internal version of TakeAvailable - it takes the
 // current time as an argument to enable easy testing.
 func (tb *Bucket) takeAvailable(now time.Time, count int64) int64 {
@@ -238,6 +274,7 @@ func (tb *Bucket) takeAvailable(now time.Time, count int64) int64 {
 		count = tb.availableTokens
 	}
 	tb.availableTokens -= count
+	tb.setDBAvailableTokens(tb.availableTokens)
 	return count
 }
 
@@ -282,6 +319,7 @@ func (tb *Bucket) take(now time.Time, count int64, maxWait time.Duration) (time.
 	avail := tb.availableTokens - count
 	if avail >= 0 {
 		tb.availableTokens = avail
+		tb.setDBAvailableTokens(avail)
 		return 0, true
 	}
 	// Round up the missing tokens to the nearest multiple
@@ -297,6 +335,7 @@ func (tb *Bucket) take(now time.Time, count int64, maxWait time.Duration) (time.
 		return 0, false
 	}
 	tb.availableTokens = avail
+	tb.setDBAvailableTokens(avail)
 	return waitTime, true
 }
 
@@ -310,6 +349,7 @@ func (tb *Bucket) currentTick(now time.Time) int64 {
 // available in the bucket at the given time, which must
 // be in the future (positive) with respect to tb.latestTick.
 func (tb *Bucket) adjustavailableTokens(tick int64) {
+	tb.refeshDBAvailableTokens()
 	if tb.availableTokens >= tb.capacity {
 		return
 	}
@@ -318,6 +358,40 @@ func (tb *Bucket) adjustavailableTokens(tick int64) {
 		tb.availableTokens = tb.capacity
 	}
 	tb.latestTick = tick
+
+	tb.setDBAvailableTokens(tb.availableTokens)
+	return
+}
+
+func (tb *Bucket) refeshDBAvailableTokens() {
+	if tb.redisConn == nil {
+		return
+	}
+	dbKey := fmt.Sprintf("%s-%s", tb.CacheKey, "AvailableTokens")
+	db := tb.redisConn
+
+	tokens, err := redis.Int64(db.Do("GET", dbKey))
+	fmt.Println(tokens, err)
+
+	if err != nil && err != redis.ErrNil {
+		fmt.Println(fmt.Sprintf("ratelimit redis error %v", err))
+	}
+	tb.availableTokens = tokens
+	return
+}
+
+func (tb *Bucket) setDBAvailableTokens(tokens int64) {
+	if tb.redisConn == nil {
+		return
+	}
+	dbKey := fmt.Sprintf("%s-%s", tb.CacheKey, "AvailableTokens")
+	db := tb.redisConn
+
+	_, err := db.Do("SETEX", dbKey, redisTimeout, tokens)
+
+	if err != nil {
+		fmt.Println(fmt.Sprintf("ratelimit redis error %v", err))
+	}
 	return
 }
 
@@ -341,4 +415,9 @@ func (realClock) Now() time.Time {
 // Now implements Clock.Sleep by calling time.Sleep.
 func (realClock) Sleep(d time.Duration) {
 	time.Sleep(d)
+}
+
+func md5String(str string) string {
+	md5str := fmt.Sprintf("%x", md5.Sum([]byte(str)))
+	return md5str
 }
