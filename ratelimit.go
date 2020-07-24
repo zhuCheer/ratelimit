@@ -242,6 +242,15 @@ func (tb *Bucket) TakeAvailable(count int64) int64 {
 	return tb.takeAvailable(tb.clock.Now(), count)
 }
 
+func (tb *Bucket) TakeAvailableWaitWithRedis(count int64, maxWait time.Duration, conn redis.Conn) (token int64) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.redisConn = conn
+
+	return tb.TakeAvailableWait(count, maxWait)
+}
+
+
 func (tb *Bucket) TakeAvailableWait(count int64, maxWait time.Duration) (token int64) {
 	timer := time.NewTimer(maxWait)
 	for {
